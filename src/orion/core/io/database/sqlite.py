@@ -11,6 +11,7 @@
 import functools
 import operator
 import pickle
+from uuid import uuid4 as random_uuid
 
 import sqlite3
 
@@ -31,30 +32,38 @@ def sqlite_exception_wrapper(method):
 
 
 def _mongo_binary_op(f):
-    def _inner(v):
-        return functools.partial(f, v)
-    return _inner
+    def _op1(b):
+        def _op2(a):
+            return f(a, b)
+        return _op2
+    return _op1
 
 
 _mongo_ops = {
     "$eq": _mongo_binary_op(operator.eq),
-    "$lt": _mongo_binary_op(operator.lt),
     "$gt": _mongo_binary_op(operator.gt),
+    "$gte": _mongo_binary_op(lambda a, b: a >= b),
+    "$in": _mongo_binary_op(lambda a, b: a in b),
+    "$lt": _mongo_binary_op(operator.lt),
+    "$lte": _mongo_binary_op(lambda a, b: a <= b),
     "$ne": _mongo_binary_op(operator.ne),
-    "$in": _mongo_binary_op(lambda a, b: a in b)
+    "$nin": _mongo_binary_op(lambda a, b: a not in b)
 }
 
 
 def _parse_mongo_statement(field, query):
     if field.startswith("$"):
-        return _mongo_ops[field]
+        return _mongo_ops[field](query)
     else:
         field_parts = field.split(".")
         f = _parse_mongo_query(query)
         def _inner(o):
-            for p in field_parts:
-                o = o[p]
-            return f(o)
+            try:
+                for p in field_parts:
+                    o = o[p]
+                return f(o)
+            except KeyError:
+                return False
         return _inner
 
 
@@ -81,7 +90,7 @@ def _parse_mongo_query(query):
     return _inner
 
 
-class Document(dict):
+class Document(object):
     @staticmethod
     def adapter(document):
         return pickle.dumps(document, protocol=4)
@@ -92,7 +101,7 @@ class Document(dict):
 
 
 # Register the type in the sqlite database
-sqlite3.register_adapter(Document, Document.adapter)
+sqlite3.register_adapter(dict, Document.adapter)
 sqlite3.register_converter("pickle", Document.converter)
 
 
@@ -130,7 +139,7 @@ class Sqlite(AbstractDB):
         # Create the documents table
         with self._conn as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS documents"
-                         "(id INTEGER PRIMARY KEY, collection TEXT, "
+                         "(id TEXT PRIMARY KEY, collection TEXT, "
                          "document PICKLE)")
             conn.execute("CREATE INDEX IF NOT EXISTS data_idx ON documents"
                          "(collection)")
@@ -162,18 +171,34 @@ class Sqlite(AbstractDB):
         # TODO: Actually enforce uniqueness and maybe index stuff
         pass
 
+    def _get_document_by_id(self, conn, idx):
+        return conn.execute(
+            "SELECT document FROM documents WHERE id=?",
+            (idx,)
+        )
+
     def _get_documents(self, conn, collection):
         return conn.execute(
-            "SELECT id, document FROM documents WHERE collection=?",
+            "SELECT document FROM documents WHERE collection=?",
             (collection,)
         )
 
     def _find(self, conn, collection, query):
         # TODO: Use the indexes to speed up things
+
+        # Special care for _id searches
+        if isinstance(query, dict) and "_id" in query:
+            if not isinstance(query["_id"], dict):
+                doc = self._get_document_by_id(conn, query["_id"]).fetchone()
+                if doc is not None:
+                    yield doc[0]
+                raise StopIteration()
+
+        # Generic table scan
         match = _parse_mongo_query(query)
-        for d in self._get_documents(conn, collection):
-            if match(d):
-                yield d
+        for doc, in self._get_documents(conn, collection):
+            if match(doc):
+                yield doc
 
     def _find_one(self, conn, collection, query):
         try:
@@ -184,18 +209,20 @@ class Sqlite(AbstractDB):
     def _select(self, document, selection):
         return document
 
-    def _update_document(self, conn, index, document):
+    def _update_document(self, conn, document):
         return conn.execute(
             "UPDATE documents SET document=? WHERE id=?",
-            (document, index)
+            (document, document["_id"])
         )
 
     def _insert_many(self, conn, collection, documents):
         # TODO: Validate and update indexes
         for d in documents:
+            if "_id" not in d:
+                d["_id"] = str(random_uuid())
             conn.execute(
-                "INSERT INTO documents (collection, document) VALUES (?, ?)",
-                (collection, d)
+                "INSERT INTO documents VALUES (?, ?, ?)",
+                (d["_id"], collection, d)
             )
 
     def _delete_many(self, conn, indices):
@@ -222,8 +249,8 @@ class Sqlite(AbstractDB):
                 # We found stuff so update them
                 else:
                     for d in documents:
-                        d[1].update(data)
-                        self._update_document(conn, d[0], d[1])
+                        d.update(data)
+                        self._update_document(conn, d)
 
     @sqlite_exception_wrapper
     def read(self, collection_name, query=None, selection=None):
@@ -236,12 +263,10 @@ class Sqlite(AbstractDB):
     @sqlite_exception_wrapper
     def read_and_write(self, collection_name, query, data, selection=None):
         with self._conn as conn:
-            rval = self._find_one(con, collection_name, query)
-            if rval is None:
-                return None
-            index, doc = rval
-            doc.update(data)
-            self._update_document(conn, index, doc)
+            doc = self._find_one(conn, collection_name, query)
+            if doc is not None:
+                doc.update(data)
+                self._update_document(conn, doc)
 
             return doc
 
@@ -255,5 +280,5 @@ class Sqlite(AbstractDB):
         with self._conn as conn:
             self._delete_many(
                 conn,
-                [d[0] for d in self._find(conn, collection_name, query)]
+                [d["_id"] for d in self._find(conn, collection_name, query)]
             )
